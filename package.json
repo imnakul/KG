@@ -1,11 +1,16 @@
 {
   "dependencies": {
     "@google/generative-ai": "^0.24.0",
+    "@langchain/community": "^0.3.41",
+    "@langchain/core": "^0.3.49",
+    "@langchain/google-genai": "^0.2.5",
     "@qdrant/js-client-rest": "^1.14.0",
     "axios": "^1.9.0",
     "chalk": "^5.4.1",
+    "cheerio": "^1.0.0",
     "dotenv": "^16.5.0",
     "neo4j-driver": "^5.28.1",
-    "ora": "^8.2.0"
+    "ora": "^8.2.0",
+    "pdf-parse": "^1.1.1"
   }
 }
