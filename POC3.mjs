@@ -11,11 +11,29 @@ import { GoogleGenerativeAI } from '@google/generative-ai'
 import dotenv from 'dotenv'
 dotenv.config()
 
-//?? Document Preparation using Langchain
-
+//?? INITILIZATION
 const genAI = new GoogleGenerativeAI(process.env.GOOGLE_API_KEY)
 const model = genAI.getGenerativeModel({ model: 'gemini-2.0-flash' })
 
+//~ Neo4j Connection
+const URI = process.env.NEO4J_URI
+const USER = process.env.NEO4J_USERNAME
+const PASSWORD = process.env.NEO4J_PASSWORD
+const driver = neo4j.driver(URI, neo4j.auth.basic(USER, PASSWORD))
+await driver
+   .getServerInfo()
+   .then((info) => {
+      console.log('\nConnection established to Neo4j\n')
+      // console.log(info)
+   })
+   .catch((err) => {
+      console.log(`Neo4j Connection error\n${err}\nCause: ${err.cause}`)
+   })
+
+//?? INITILIZATION END
+
+//?? FUNCTIONS DECLARATIONS
+//? Not using right Now , becuase was generating more Nodes and Relationships
 async function geminiLLMParser(prompt) {
    const result = await model.generateContent({
       contents: [
@@ -64,6 +82,11 @@ async function geminiLLMParser(prompt) {
       console.error('Failed to parse Graph JSON:', rawText)
       return null
    }
+}
+
+//? To control Calls to Gemini API
+function sleep(ms) {
+   return new Promise((resolve) => setTimeout(resolve, ms))
 }
 
 async function geminiSingleRelationshipParser(prompt) {
@@ -241,10 +264,12 @@ async function processAllSplits(allSplits) {
 
    return results
 }
+//?? FUNCTIONS DECLARATIONS END
 
+//?? MAIN FUNCTION
 async function main(type, web_url, question) {
-   let allSplits
    //~ Document Fetching, creating Chunks using LANGCHAIN
+   let allSplits
    const spinnerIndex = ora('Document Preparation...\n').start()
    let docs
    try {
@@ -280,46 +305,99 @@ async function main(type, web_url, question) {
       spinnerIndex.fail('Document Preparation Failed')
       return
    }
-   //~ We Have chunks of data ready to be converted!
-   //    //    const yourChunk = `Elon Musk founded SpaceX with the goal of making Mars colonization possible. Tesla, another company he leads, focuses on electric vehicles.`
 
-   //    console.log('🔵 Extracting entities...')
-   //    const entities = await extractEntities(allSplits[0].pageContent)
-   //    console.log('Entities Found:', entities)
-
-   //    const schema = `
-   // (:Person)-[:FOUNDED]->(:Organization)
-   // (:Organization)-[:WORKS_ON]->(:Project)
-   // `
-
-   //    //    const yourQuestion = 'Which organizations did Elon Musk found?'
-
-   //    console.log('\n🟣 Generating Cypher query...')
-   //    const cypherQuery = await generateCypher(schema, question)
-   //    console.log('Cypher Query:\n', cypherQuery)
-
-   //    const inputText = 'Steve Jobs founded Apple. Apple acquired Beats.'
+   //~ Creating Entities / Relationships from Retrieved Docs Chunks!
    const graphDataset = new Set()
-
    const enrichedChunks = await processAllSplits(allSplits)
    console.log(JSON.stringify(enrichedChunks, null, 2))
 
    for (const chunk of enrichedChunks) {
-      const graphData = await geminiSingleRelationshipParser(
-         chunk.titleAndSummary
-      )
-      console.log('Graph Data:', JSON.stringify(graphData, null, 2))
-      //   for (const item of graphData.graph) {
-      //      graphDataset.add(JSON.stringify(item))
-      //   }
-      if (graphData) {
-         graphDataset.add(JSON.stringify(graphData))
+      try {
+         const graphData = await geminiSingleRelationshipParser(
+            chunk.titleAndSummary
+         )
+         console.log('Graph Data:', JSON.stringify(graphData, null, 2))
+         if (graphData) {
+            graphDataset.add(JSON.stringify(graphData))
+         }
+         await sleep(1000) // Sleep for 1 seconds to control API calls
+      } catch (error) {
+         console.error('Error while parsing graph data:', error.message)
       }
    }
-   console.log('Unique Graph Data:', graphDataset)
-   //    const graphData = await geminiLLMParser(allSplits[0].pageContent)
 
-   //    console.log(JSON.stringify(graphData, null, 2))
+   console.log('Unique Graph Data:', graphDataset)
+
+   //~ Ingesting graphDataset into Neo4j
+
+   const session = driver.session()
+
+   // Create maps to store nodes and relationships
+   const nodes = new Map()
+   const relationships = []
+   const spinnerIngest = ora('Ingesting data to Neo4j...\n').start()
+   try {
+      // Process your Set and prepare nodes and relationships
+      for (const item of graphDataset) {
+         const { node, target_node, relationship } = JSON.parse(item)
+
+         // Add nodes if they don't exist
+         if (!nodes.has(node)) {
+            nodes.set(
+               node,
+               `${node}_${Math.random().toString(36).substring(2, 8)}`
+            ) // simple unique id
+         }
+         if (!nodes.has(target_node)) {
+            nodes.set(
+               target_node,
+               `${target_node}_${Math.random().toString(36).substring(2, 8)}`
+            )
+         }
+
+         // Add relationship
+         relationships.push({
+            source: nodes.get(node),
+            target: nodes.get(target_node),
+            type: relationship,
+         })
+      }
+
+      // Ingest nodes
+      for (const [name, id] of nodes.entries()) {
+         await session.run('CREATE (n:Entity {id: $id, name: $name})', {
+            id,
+            name,
+         })
+      }
+
+      // Ingest relationships
+      for (const rel of relationships) {
+         await session.run(
+            `
+          MATCH (a:Entity {id: $source_id}), (b:Entity {id: $target_id})
+          CREATE (a)-[:RELATIONSHIP {type: $type}]->(b)
+        `,
+            {
+               source_id: rel.source,
+               target_id: rel.target,
+               type: rel.type,
+            }
+         )
+      }
+      console.log('\n')
+      spinnerIngest.succeed(
+         chalk.bold.bgGreen.black('Data ingested successfully!')
+      )
+   } catch (error) {
+      console.log('\n')
+      spinnerIngest.fail(chalk.bold.bgRed('Data ingestion failed'))
+      console.error('\nError ingesting data to Neo4j:', error)
+   } finally {
+      await session.close()
+      await driver.close()
+      console.log('\nNeo4j connection closed.\n')
+   }
 }
 
 //?? MAIN FUNCTION CALL
